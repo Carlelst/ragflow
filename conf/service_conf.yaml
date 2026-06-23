@@ -14,9 +14,9 @@ mysql:
   stale_timeout: 300
   max_allowed_packet: 1073741824
 minio:
-  user: 'rag_flow'
-  password: 'infini_rag_flow'
-  host: 'localhost:9000'
+  user: 'minioadmin'
+  password: 'minioadmin'
+  host: '172.16.90.36:9000'
   bucket: ''
   prefix_path: ''
 es:

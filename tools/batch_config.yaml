@@ -1,0 +1,154 @@
+# ==========================================================================
+# RAGFlow 批量导入配置文件
+# 用法: python3 batch_import.py --config batch_config.yaml
+# ==========================================================================
+
+# ══════════════════════════════════════════════════════════════════════════
+# 基本配置
+# ══════════════════════════════════════════════════════════════════════════
+source: wiki                  # wiki | html | wangpan | all (all=依次处理三个源)
+limit: 0                      # 每源导入上限，0=全部，用于测试时设 10/50
+
+# ══════════════════════════════════════════════════════════════════════════
+# 管道控制
+# ══════════════════════════════════════════════════════════════════════════
+no_parse: false               # true=只写元数据不进队列，用于预导入/分步执行
+wait_for_parse: true          # true=向量化完成才退出，false=入队即退出
+wait_timeout: 7200            # 等待超时秒数，过大文档可调大。建议 >= 文档数*5s
+
+# ══════════════════════════════════════════════════════════════════════════
+# 外部数据源连接
+# ══════════════════════════════════════════════════════════════════════════
+pg:
+  host: "10.9.200.14"         # PostgreSQL 主机
+  port: 5432                  # PostgreSQL 端口
+  user: "postgres"            # PostgreSQL 用户
+  password: "enflame"         # PostgreSQL 密码
+  dbname: "metadata"          # PostgreSQL 数据库名
+
+minio:
+  host: "172.16.90.36:9000"   # MinIO 地址 (含端口)
+  user: "minioadmin"          # MinIO 用户
+  password: "minioadmin"      # MinIO 密码
+  bucket: "rag-data"          # MinIO bucket 名
+
+# ══════════════════════════════════════════════════════════════════════════
+# 数据源级别配置
+#
+# 顶层 chunk_tokens / enable_* 为默认值，sources.<name> 下可覆盖。
+# 每个 source 可独立设置分块策略、是否开启图谱/摘要。
+# ══════════════════════════════════════════════════════════════════════════
+sources:
+  # ──────────────────────────────────────────────────────────────────
+  wiki:
+    # ── 分块 ───────────────────────────────────────────────────────
+    chunk_tokens: 400         # 每个 chunk 的 token 数。
+                              #   太小(<200): 检索精确但缺上下文
+                              #   太大(>800): 上下文完整但噪声多
+                              #   Wiki/markdown 建议 256-512
+                              #   qwen3-vl-embedding-8b 上限 8192
+
+    delimiter: "\n"           # 段落分割符。\n=按段落, "。"=按句子, 也可组合 "\n!?。；！？"
+                              #   默认(推荐): "\n"
+
+    overlapped_percent: 10    # 相邻 chunk 重叠百分比 (0-100)。
+                              #   太小(<5): 边界信息丢失
+                              #   太大(>30): 冗余多、索引膨胀
+                              #   建议: 10-20
+
+    # ── 子文本块 ───────────────────────────────────────────────────
+    # 为每个 chunk 同时生成更小的子块，提升细粒度检索命中率。
+    # enable_children: false   # 是否启用子块，默认 false
+    # children_delimiter: "\n" # 子块分割符，默认 "\n"
+
+    # ── 智能提取 (需要 Chat LLM) ────────────────────────────────────
+    # auto_keywords: 0         # 自动提取关键词数，0=关闭。建议 3-10。
+    #                           #   开启后每个 chunk 自动生成关键词，提升检索召回。
+    #                           #   代价: 每篇文档增加 LLM 调用。
+    # auto_questions: 0        # 自动生成假设性问题数，0=关闭。建议 3-5。
+    #                           #   自动生成用户可能问的问题并向量化，大幅提升 Q&A 召回。
+    #                           #   代价: LLM 调用量较大。
+    # toc_extraction: false    # 自动提取文档目录结构。有章节结构的文档建议开启。
+    #                           #   建议: true (技术文档)
+
+    # ── 自动元数据 ──────────────────────────────────────────────────
+    # enable_metadata: false   # 启用 LLM 自动提取文档元数据 (标题/作者/日期/标签等)
+    # metadata: []             # 自定义元数据 JSON schema，格式: [{"key":"author","type":"string"}]
+    # built_inmetadata: []    # 内置元数据字段，可选: page_count, file_size, creation_date
+
+    # ── GraphRAG 知识图谱 ──────────────────────────────────────────
+    # 从文档中提取实体和关系，构建知识图谱。依赖向量索引先完成。
+    # LLM 消耗: 大 (每 chunk 至少一次 Chat LLM 调用)
+    enable_graphrag: false
+    graphrag:
+      # ---- 核心参数 ----
+      method: light            # 提取方法:
+                               #   light:  基于 prompt 引导，速度快，适合大多数场景 (推荐)
+                               #   general: 更精细的实体/关系提取，质量更高但更慢更贵
+      entity_types:            # 要提取的实体类型，按需调整
+        - organization         # 组织机构 (公司/部门/团队名)
+        - person               # 人名
+        - geo                  # 地理位置
+        - event                # 事件/会议/里程碑
+        - category             # 分类/标签
+        # 芯片验证场景可加:
+        # - technology         # 技术/协议
+        # - component          # 组件/模块
+      batch_chunk_token_size: 4096  # 每次 LLM 调用处理的总 token 量。
+                                    #   太小: 调用频繁、慢
+                                    #   太大: 超出 LLM 上下文
+                                    #   light 方法推荐 4096，general 可设 8192
+
+      # ---- 高级参数 ----
+      # resolution: false      # 实体解析 (消歧义: "SIP4.5" 和 "SIP 4.5" 是否同一实体)
+      #                         #   建议: 文档量大且实体重复多时开启
+      # community: false       # 生成社区报告 (按 Leid是社区检测结果分组生成摘要)
+      #                         #   建议: 文档量大(>100)且需要宏观理解时开启
+
+      # ---- 超时与重试 (一般不需要改) ----
+      # retry_attempts: 2
+      # retry_backoff_seconds: 2
+      # retry_backoff_max_seconds: 60
+      # build_subgraph_timeout_per_chunk_seconds: 300
+      # build_subgraph_min_timeout_seconds: 600
+      # merge_timeout_seconds: 180
+      # resolution_timeout_seconds: 1800
+      # community_timeout_seconds: 1800
+      # lock_acquire_timeout_seconds: 600
+
+    # ── RAPTOR 层级摘要 ────────────────────────────────────────────
+    # 对文档进行层次聚类后逐层生成摘要，构建"金字塔"式索引。
+    # LLM 消耗: 中等 (每个聚类一次 Chat LLM 调用)
+    enable_raptor: false
+    raptor:
+      max_token: 256           # 每层摘要最大 token 数。
+                               #   太小(<128): 摘要太简略
+                               #   太大(>512): 摘要冗余
+                               #   建议: 256-512
+      threshold: 0.1           # 聚类相似度阈值 (0-1)。
+                               #   越小聚类越紧 (簇多、摘要细)，越大聚类越松 (簇少、摘要粗)
+                               #   建议: 0.1-0.3
+      max_cluster: 64          # 最大聚类数。
+                               #   限制每层最多产生多少个簇，防止内存爆炸
+                               #   建议: 64-128
+      random_seed: 0           # 随机种子，固定可保证结果可复现
+      scope: file              # 生成范围:
+                               #   file:    每篇文档独立生成 (推荐，适合异构文档)
+                               #   dataset: 整个知识库全局聚类 (适合同主题文档集)
+      clustering_method: gmm   # 聚类方法:
+                               #   gmm: 高斯混合模型，自动确定簇数，适合大多数场景 (推荐)
+                               #        注意: v0.25.6 版本中 ahc 是备选，gmm 更成熟
+      # tree_builder: raptor   # 树构建策略，默认 raptor (不推荐修改)
+      # prompt: "Please summarize..."  # 自定义摘要提示词，默认使用 RAGFlow 内置英文 prompt。
+      #                                 #   中文场景建议自定义为中文提示词:
+      #                                 #   "请总结以下段落。注意数字准确性，不要编造内容。段落如下:\n{cluster_content}\n以上就是你需要总结的内容。"
+
+  # ──────────────────────────────────────────────────────────────────
+  html:
+    chunk_tokens: 400         # HTML 文档通常比 markdown 长，可适当增大
+    # HTML 源默认不开启 GraphRAG/RAPTOR，按需复制 wiki 的配置
+
+  # ──────────────────────────────────────────────────────────────────
+  wangpan:
+    chunk_tokens: 400         # 网盘文件类型混杂，取折中值
+    # 未测试: wangpan_metadata 表当前可能为空

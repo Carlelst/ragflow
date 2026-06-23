@@ -805,7 +805,7 @@ async def run_dataflow(task: dict):
             @timeout(60)
             def batch_encode(txts):
                 nonlocal embedding_model
-                return embedding_model.encode([truncate(c, embedding_model.max_length - 10) for c in txts])
+                return embedding_model.encode([truncate(c, embedding_model.max_length - 50) for c in txts])
 
             vects_batches = []
             texts = [o.get("questions", o.get("summary", o["text"])) for o in chunks]

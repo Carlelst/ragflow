@@ -241,3 +241,8 @@ bin/*
 # Local agent tooling state (per-developer; not for commit)
 .omc/
 .marscode/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
