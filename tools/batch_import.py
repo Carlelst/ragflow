@@ -22,8 +22,191 @@ RAGFlow 批量导入工具 — 按数据源分别导入
   python3 batch_import.py --status
 """
 
-import argparse, json, random, string, sys, os, time
+import argparse, json, random, string, sys, os, time, base64, io, re
 from datetime import datetime
+
+import requests
+from minio import Minio
+
+
+# ══════════════════════════════════════════════════════════════════════
+# VLM 图片识别配置
+# ══════════════════════════════════════════════════════════════════════
+
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://172.16.90.45:8082/v1")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "scs_qwen3.5-397b")
+VLLM_MAX_TOKENS = int(os.environ.get("VLLM_MAX_TOKENS", "1024"))
+VLLM_TIMEOUT = int(os.environ.get("VLLM_TIMEOUT", "60"))
+VLM_ENABLED = os.environ.get("VLM_ENABLED", "1") == "1"
+
+
+def _resolve_image_path(minio_client, bucket, doc_minio_key, relative_path):
+    """将 markdown 中的相对图片路径解析为 MinIO 中的实际路径"""
+    import os as _os
+    doc_dir = _os.path.dirname(doc_minio_key)
+    resolved = _os.path.normpath(_os.path.join(doc_dir, relative_path)).replace("\\", "/")
+    try:
+        minio_client.stat_object(bucket, resolved)
+        return resolved
+    except Exception:
+        pass
+    # 向上查找 images/ 目录
+    filename = _os.path.basename(relative_path)
+    parts = doc_dir.split("/")
+    for i in range(len(parts), 0, -1):
+        candidate = "/".join(parts[:i]) + "/images/" + filename
+        try:
+            minio_client.stat_object(bucket, candidate)
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _describe_image_vllm(image_bytes, alt_text=""):
+    """用 VLLM 模型描述图片内容"""
+    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        "请用中文描述这张图片的内容。如果是截图，描述其中显示的信息、数据和关键内容。"
+        "如果是架构图或流程图，描述其结构和关系。限制在150字以内。"
+    )
+    if alt_text:
+        prompt = f"图片alt文本: {alt_text}\n{prompt}"
+
+    payload = {
+        "model": VLLM_MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+        ]}],
+        "max_tokens": VLLM_MAX_TOKENS,
+        "temperature": 0.1,
+    }
+    resp = requests.post(f"{VLLM_BASE_URL}/chat/completions", json=payload, timeout=VLLM_TIMEOUT)
+    resp.raise_for_status()
+    result = resp.json()
+    desc = result["choices"][0]["message"]["content"].strip()
+    return desc if desc else None
+
+
+def _build_pg_meta(row, source_key):
+    """根据数据源类型，从 PG 行数据构建元数据字典"""
+    meta = {}
+    if source_key == "wiki":
+        for pg_col, label in [
+            ("title", "title"), ("source_url", "wiki_url"),
+            ("page_id", "wiki_page_id"), ("space_key", "wiki_space"),
+        ]:
+            v = row.get(pg_col)
+            if v:
+                meta[label] = str(v)
+        wp = row.get("wiki_path")
+        if isinstance(wp, list):
+            meta["wiki_path"] = " > ".join(str(p) for p in wp)
+        elif wp:
+            meta["wiki_path"] = str(wp)
+        img = row.get("image_urls")
+        if isinstance(img, list) and img:
+            meta["image_urls"] = ", ".join(str(u) for u in img)
+    elif source_key == "html":
+        for pg_col, label in [
+            ("title", "title"), ("source_url", "source_url"),
+            ("description", "description"), ("author", "author"),
+            ("domain", "domain"), ("keywords", "keywords"),
+        ]:
+            v = row.get(pg_col)
+            if v:
+                meta[label] = str(v)
+    elif source_key == "wangpan":
+        for pg_col, label in [
+            ("wangpan_file_name", "title"), ("wangpan_file_path", "file_path"),
+            ("wangpan_editor", "editor"), ("wangpan_size", "file_size"),
+        ]:
+            v = row.get(pg_col)
+            if v:
+                meta[label] = str(v)
+    lu = row.get("last_updated")
+    if lu:
+        meta["last_updated"] = lu.isoformat() if hasattr(lu, "isoformat") else str(lu)
+    return {k: v for k, v in meta.items() if v}
+
+
+def enrich_markdown_images(minio_client, bucket, minio_key, source_url, image_urls=None):
+    """
+    从 MinIO 读取 markdown，注入 PG 元数据 + VLM 图片描述。
+
+    返回: (enriched_text, uploaded_minio_path) 或 (None, None) 如果无图片/失败
+    不修改原始 MinIO 文件；增强文本上传到 _vlm_enriched/ 前缀路径。
+    """
+    if not VLM_ENABLED and not pg_meta:
+        return None, None
+
+    try:
+        data = minio_client.get_object(bucket, minio_key)
+        content = data.read().decode("utf-8")
+        data.close()
+        data.release_conn()
+    except Exception:
+        return None, None
+
+    is_markdown = minio_key.endswith(".md")
+    modified = False
+
+    # ── VLM 图片识别（仅 markdown 文件）──
+    if is_markdown and VLM_ENABLED:
+        img_refs = re.findall(r"!\[([^\]]*)\]\(([^)]+)\)", content)
+        for alt_text, rel_path in img_refs:
+            if rel_path.startswith(("http://", "https://", "data:")):
+                continue
+            if not rel_path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+                continue
+
+            img_path = _resolve_image_path(minio_client, bucket, minio_key, rel_path)
+            if not img_path:
+                continue
+
+            try:
+                img_data = minio_client.get_object(bucket, img_path)
+                img_bytes = img_data.read()
+                img_data.close()
+                img_data.release_conn()
+            except Exception:
+                continue
+
+            try:
+                desc = _describe_image_vllm(img_bytes, alt_text)
+            except Exception:
+                continue
+            if not desc:
+                continue
+
+            suffix = f"\n\n> [Image Description]: {desc}"
+            # 匹配原始 Confluence 图片 URL
+            if image_urls:
+                img_filename = os.path.basename(rel_path)
+                for img_url in image_urls:
+                    if img_filename in img_url:
+                        suffix += f"\n> [Image URL]: {img_url}"
+                        break
+            old_ref = f"![{alt_text}]({rel_path})"
+            content = content.replace(old_ref, old_ref + suffix)
+            modified = True
+
+    if not modified:
+        return None, None
+
+    enriched_path = f"_vlm_enriched/{minio_key}"
+    try:
+        data_bytes = content.encode("utf-8")
+        minio_client.put_object(
+            bucket, enriched_path,
+            io.BytesIO(data_bytes), len(data_bytes),
+            content_type="text/markdown",
+        )
+    except Exception:
+        return None, None
+
+    return content, enriched_path
 
 
 # ══════════════════════════════════════════════════════════════════════# 数据源配置
@@ -380,17 +563,17 @@ def queue_graph_tasks(tenant_id, kb_id, doc_ids, with_graphrag, with_raptor):
         try:
             graphrag_id = queue_raptor_o_graphrag_tasks(sample_doc, "graphrag", 0, doc_ids=doc_ids,
                                                         fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID)
-            print(f"  ✅ GraphRAG queued ({len(doc_ids)} docs) task_id={graphrag_id}")
+            print(f"  [OK] GraphRAG queued ({len(doc_ids)} docs) task_id={graphrag_id}")
         except Exception as e:
-            print(f"  ❌ GraphRAG: {e}")
+            print(f"  [ERR] GraphRAG: {e}")
 
     if with_raptor:
         try:
             raptor_id = queue_raptor_o_graphrag_tasks(sample_doc, "raptor", 0, doc_ids=doc_ids,
                                                       fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID)
-            print(f"  ✅ RAPTOR queued ({len(doc_ids)} docs) task_id={raptor_id}")
+            print(f"  [OK] RAPTOR queued ({len(doc_ids)} docs) task_id={raptor_id}")
         except Exception as e:
-            print(f"  ❌ RAPTOR: {e}")
+            print(f"  [ERR] RAPTOR: {e}")
 
     return graphrag_id, raptor_id
 
@@ -412,28 +595,28 @@ def wait_for_graph_tasks(kb_id, graphrag_id, raptor_id, timeout=7200, poll_inter
     if not waited:
         return
 
-    print(f"  ⏳ 等待知识图谱生成 ({', '.join(waited)})...")
+    print(f"    等待知识图谱生成 ({', '.join(waited)})...")
     while waited:
         kb = Knowledgebase.get_by_id(kb_id)
         elapsed = time.time() - started
 
         if "graphrag" in waited and kb.graphrag_task_finish_at:
-            print(f"\n  ✅ GraphRAG 完成 ({elapsed:.0f}s)")
+            print(f"\n[OK] GraphRAG 完成 ({elapsed:.0f}s)")
             waited.discard("graphrag")
 
         if "raptor" in waited and kb.raptor_task_finish_at:
-            print(f"\n  ✅ RAPTOR 完成 ({elapsed:.0f}s)")
+            print(f"\n[OK] RAPTOR 完成 ({elapsed:.0f}s)")
             waited.discard("raptor")
 
         if not waited:
             break
 
         if elapsed > timeout:
-            print(f"\n  ⚠️ 超时 ({timeout}s)，{' '.join(waited)} 未完成")
+            print(f"\n    超时 ({timeout}s)，{' '.join(waited)} 未完成")
             break
 
         remaining = ', '.join(waited)
-        print(f"\r  📊 {remaining} 生成中... ({elapsed:.0f}s elapsed)", end="", flush=True)
+        print(f"\r  {remaining} 生成中... ({elapsed:.0f}s elapsed)", end="", flush=True)
         time.sleep(poll_interval)
 
 
@@ -463,7 +646,7 @@ def wait_for_parse(kb_id, doc_ids, timeout=3600, poll_interval=10):
         total = len(docs)
         elapsed = time.time() - started
 
-        print(f"\r  📊 进度: ✅{done} ❌{fail} 🔄{processing} / {total}  "
+        print(f"\r  进度: [OK]{done} [ERR]{fail} {processing} / {total}  "
               f"({elapsed:.0f}s elapsed)", end="", flush=True)
 
         if processing == 0:
@@ -471,7 +654,7 @@ def wait_for_parse(kb_id, doc_ids, timeout=3600, poll_interval=10):
             return done, fail, False
 
         if elapsed > timeout:
-            print(f"\n  ⚠️ 超时 ({timeout}s)，还有 {processing} 篇未完成")
+            print(f"\n    超时 ({timeout}s)，还有 {processing} 篇未完成")
             return done, fail, True
 
         time.sleep(poll_interval)
@@ -484,17 +667,17 @@ def show_all_status(tenant_id):
     for source_key, cfg in SOURCE_CONFIGS.items():
         kb = KnowledgebaseService.query(name=cfg["kb_name"], tenant_id=tenant_id)
         if not kb:
-            print(f"\n📭 {cfg['kb_name']} ({cfg['description']}) — 未创建")
+            print(f"\n{cfg['kb_name']} ({cfg['description']}) — 未创建")
             continue
         kb = kb[0]
         docs = list(Document.select().where(Document.kb_id == kb.id))
         by_run = {"0": 0, "1": 0, "2": 0, "3": 0, "4": 0}
         for d in docs:
             by_run[d.run] = by_run.get(d.run, 0) + 1
-        run_map = {"0": "⏳", "1": "🔄", "2": "⏸", "3": "✅", "4": "❌"}
+        run_map = {"0": " ", "1": "", "2": "", "3": "[OK]", "4": "[ERR]"}
         total_chunks = sum(d.chunk_num or 0 for d in docs)
         total_tokens = sum(d.token_num or 0 for d in docs)
-        print(f"\n📚 {kb.name} ({cfg['description']})")
+        print(f"\n{kb.name} ({cfg['description']})")
         print(f"   文档: {len(docs)} | chunks: {total_chunks} | tokens: {total_tokens}")
         print(f"   status: ", end="")
         for run, count in sorted(by_run.items()):
@@ -507,13 +690,13 @@ def show_all_status(tenant_id):
         for d in show_docs:
             if d.id in shown: continue
             shown.add(d.id)
-            print(f"   {run_map.get(d.run, '❓')} {d.name[:55]}")
+            print(f"   {run_map.get(d.run, '?')} {d.name[:55]}")
         if len(docs) > 5:
             print(f"   ... 还有 {len(docs)-5} 篇")
         # 显示失败的
         failed = [d for d in docs if d.run == "4"]
         if failed:
-            print(f"   ❌ 失败文档 ({len(failed)}):")
+            print(f"   [ERR] 失败文档 ({len(failed)}):")
             for d in failed[:5]:
                 print(f"      - {d.name[:70]}")
 
@@ -548,7 +731,7 @@ def import_source(source_key, tenant_id, args):
     }
 
     # Step 1: KB
-    print(f"\n🔧 知识库 '{cfg['kb_name']}'")
+    print(f"\n知识库 '{cfg['kb_name']}'")
     kb = ensure_kb(tenant_id, cfg["kb_name"], args.embd_id, chunk_tokens,
                    graphrag_cfg, raptor_cfg)
     flags = " + ".join(filter(None, [
@@ -566,13 +749,13 @@ def import_source(source_key, tenant_id, args):
         "dbname": args.pg_db or PG_DEFAULTS["dbname"],
     }
     rows = fetch_rows(pg_config, cfg["source_table"], args.limit)
-    print(f"\n📥 {cfg['source_table']}: {len(rows)} 行")
+    print(f"\n{cfg['source_table']}: {len(rows)} 行")
     if not rows:
         print(f"  无数据，跳过\n")
         return kb.id, 0
 
     # Step 3: 增量对比 & 导入
-    print(f"\n📝 增量分析...")
+    print(f"\n增量分析...")
     from api.db.db_models import Document
 
     # 外部数据按 minio_key 建索引
@@ -598,19 +781,19 @@ def import_source(source_key, tenant_id, args):
     print(f"  外部: {len(rows)} | 已有: {len(existing)}")
     print(f"  新增: {len(new_rows)} | 变更: {len(changed_rows)} | 未变: {unchanged} | 删除: {len(deleted_docs)}")
 
-    # 删除已不存在于外部的文档
-    if deleted_docs:
-        print(f"\n  🗑 删除 {len(deleted_docs)} 篇...")
+    # 删除已不存在于外部的文档 (仅在无 limit 全量同步时)
+    if deleted_docs and args.limit == 0:
+        print(f"\n  删除 {len(deleted_docs)} 篇...")
         for d in deleted_docs:
             try:
                 Document.delete_by_id(d.id)
                 print(f"    - {d.name[:50]}")
             except Exception as e:
-                print(f"    - ❌ {d.name[:50]}: {e}")
+                print(f"    - [ERR] {d.name[:50]}: {e}")
 
     # 更新已变更的文档
     if changed_rows:
-        print(f"\n  📝 更新 {len(changed_rows)} 篇...")
+        print(f"\n  更新 {len(changed_rows)} 篇...")
         from api.db.services.file2document_service import File2DocumentService
         from api.db.services.task_service import queue_tasks
         for _k, ext_row, old_doc in changed_rows:
@@ -624,7 +807,37 @@ def import_source(source_key, tenant_id, args):
             print(f"    ~ {old_doc.name[:50]}")
 
     # 导入新文档
-    print(f"\n📝 导入 {len(new_rows)} 篇...")
+    print(f"\n导入 {len(new_rows)} 篇...")
+
+    # ── VLM 图片识别 ──
+    if VLM_ENABLED and (new_rows or changed_rows) and source_key == "wiki":
+        mc = Minio(minio_config["host"],
+                   access_key=minio_config["user"],
+                   secret_key=minio_config["password"],
+                   secure=minio_config.get("secure", False))
+        bucket = minio_config["bucket"]
+        all_rows = new_rows + [(k, ext_row, None) for k, ext_row, old in changed_rows]
+        enriched_count = 0
+        print(f"    VLM 图片识别: 扫描 {len(all_rows)} 篇...")
+        for i, item in enumerate(all_rows, 1):
+            if len(item) == 3:
+                k, ext_row, _old = item
+            else:
+                k, ext_row = item
+            source_url = ext_row.get("source_url", "")
+            img_urls = ext_row.get("image_urls")
+
+            enriched, enriched_path = enrich_markdown_images(mc, bucket, k, source_url, img_urls)
+            if enriched and enriched_path:
+                ext_row["_original_minio_key"] = k
+                ext_row["minio_key"] = enriched_path
+                enriched_count += 1
+                print(f"    [OK] [{i}/{len(all_rows)}] {k.rsplit('/', 1)[-1][:50]}")
+            elif i % 10 == 0:
+                print(f"    ... [{i}/{len(all_rows)}]")
+        if enriched_count:
+            print(f"    VLM 图片识别完成: {enriched_count}/{len(all_rows)} 篇含图片描述")
+
     doc_ids = []
     for _k, row in new_rows:
         try:
@@ -634,41 +847,41 @@ def import_source(source_key, tenant_id, args):
             name = (row.get('title') or row['minio_key'].rsplit('/', 1)[-1])[:50]
             print(f"  + {name}")
         except Exception as e:
-            print(f"  ❌ {str(e)[:60]}")
+            print(f"  [ERR] {str(e)[:60]}")
 
     # 合并新旧 doc_ids（新增 + 变更的都要重新解析）
     changed_ids = [old.id for _, _, old in changed_rows]
     doc_ids = changed_ids + doc_ids
 
     if not doc_ids:
-        print(f"\n  ✅ 无变化，跳过解析")
+        print(f"\n[OK] 无变化，跳过解析")
         return kb.id, 0
 
     # Step 4: 解析
     if not args.no_parse and doc_ids:
-        print(f"\n🔄 触发分块+向量化 ({len(doc_ids)} 篇)...")
+        print(f"\n触发分块+向量化 ({len(doc_ids)} 篇)...")
         queue_parse(tenant_id, kb.id, doc_ids)
 
         # 等待向量化完成
         if args.wait_for_parse:
-            print(f"  ⏳ 等待向量化完成 (最多 {args.wait_timeout}s)...")
+            print(f"    等待向量化完成 (最多 {args.wait_timeout}s)...")
             done, fail, timed_out = wait_for_parse(
                 kb.id, doc_ids,
                 timeout=args.wait_timeout,
                 poll_interval=getattr(args, 'wait_interval', 10)
             )
             if timed_out:
-                print(f"  ⚠️ 超时: {done} done, {fail} fail, 还有未完成的")
+                print(f"     超时: {done} done, {fail} fail, 还有未完成的")
             else:
-                print(f"  ✅ 向量化完成: {done} done, {fail} fail")
+                print(f"  [OK] 向量化完成: {done} done, {fail} fail")
                 # 自动重试失败文档
                 if fail > 0 and getattr(args, 'auto_retry', False):
-                    print(f"\n🔄 自动重试 {fail} 篇失败文档...")
+                    print(f"\n自动重试 {fail} 篇失败文档...")
                     retry_failed_docs(kb.id, tenant_id)
 
     # Step 5: 知识图谱
     if (enable_graphrag or enable_raptor) and doc_ids:
-        print(f"\n🧠 触发知识图谱 ({len(doc_ids)} 篇)...")
+        print(f"\n触发知识图谱 ({len(doc_ids)} 篇)...")
         g_id, r_id = queue_graph_tasks(tenant_id, kb.id, doc_ids,
                                        enable_graphrag, enable_raptor)
 
@@ -718,7 +931,7 @@ def retry_failed_docs(kb_id, tenant_id):
     # 再次等待
     doc_ids = [d.id for d in failed]
     done, fail, _ = wait_for_parse(kb_id, doc_ids, timeout=3600)
-    print(f"\n  ✅ 重试结果: {done} done, {fail} fail")
+    print(f"\n[OK] 重试结果: {done} done, {fail} fail")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -827,7 +1040,7 @@ def main():
                 sys.path.insert(0, _candidate)
                 break
         else:
-            print("❌ 找不到 RAGFlow 路径，请设置 RAGFLOW_HOME 环境变量")
+            print("[ERR] 找不到 RAGFlow 路径，请设置 RAGFLOW_HOME 环境变量")
             sys.exit(1)
     from common.config_utils import read_config
     from common.settings import init_settings
@@ -848,14 +1061,14 @@ def main():
     results = {}
     for src in sources:
         print(f"\n{'='*60}")
-        print(f"📂 {src.upper()}: {SOURCE_CONFIGS[src]['description']}")
+        print(f" {src.upper()}: {SOURCE_CONFIGS[src]['description']}")
         print(f"{'='*60}")
         kb_id, count = import_source(src, tenant_id, args)
         results[src] = {"kb_id": kb_id, "count": count}
 
     # ── 汇总 ─────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"✅ 导入完成!")
+    print(f"[OK] 导入完成!")
     print(f"{'='*60}")
     total = 0
     for src, info in results.items():
@@ -864,7 +1077,7 @@ def main():
         total += info['count']
     print(f"  {'─'*50}")
     print(f"  合计: {total} 篇文档")
-    print(f"\n  监控: docker logs -f ragflow-test")
+    print(f"\n 监控: docker logs -f ragflow-test")
 
 
 if __name__ == "__main__":
