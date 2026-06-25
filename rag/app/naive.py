@@ -1050,7 +1050,17 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
                         section_images[idx] = combined_image
                     markdown_vision_parser = VisionFigureParser(vision_model=vision_model, figures_data=[((combined_image, ["markdown image"]), [(0, 0, 0, 0, 0)])], **kwargs)
                     boosted_figures = markdown_vision_parser(callback=callback)
-                    sections[idx] = (section_text + "\n\n" + "\n\n".join([fig[0][1] for fig in boosted_figures]), sections[idx][1])
+                    descs = []
+                    for fig in boosted_figures:
+                        d = fig[0][1]
+                        if isinstance(d, list):
+                            d = "\n".join(str(x) for x in d)
+                        elif not isinstance(d, str):
+                            d = str(d)
+                        if d:
+                            descs.append(d)
+                    if descs:
+                        sections[idx] = (section_text + "\n\n" + "\n\n".join(descs), sections[idx][1])
 
         else:
             logging.warning("No visual model detected. Skipping figure parsing enhancement.")

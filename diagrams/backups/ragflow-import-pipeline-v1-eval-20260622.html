@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAGFlow 数据导入与处理管道架构图</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1600px; width: 100%; }
+        h1 {
+            text-align: center;
+            font-size: 28px;
+            margin-bottom: 8px;
+            color: #64b5f6;
+        }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 24px;
+            font-size: 14px;
+        }
+        .subtitle a { color: #64b5f6; text-decoration: none; }
+        .svg-wrapper {
+            background: #fff;
+            border-radius: 12px;
+            padding: 24px;
+            overflow-x: auto;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+            text-align: center;
+        }
+        .svg-wrapper img, .svg-wrapper object {
+            max-width: 100%;
+            height: auto;
+        }
+        .meta {
+            margin-top: 16px;
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .meta .chip {
+            background: #2a2a3e;
+            border: 1px solid #444;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 13px;
+            color: #aaa;
+        }
+        .meta .chip strong { color: #eee; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>RAGFlow 数据导入与处理管道架构</h1>
+        <p class="subtitle">
+            从外部数据源 → MinIO + PostgreSQL → RAGFlow 导入 → 三路并行索引 → 混合检索
+            &nbsp;|&nbsp;
+            <a href="https://kroki.io/mermaid/svg/eJyMV1tT20gWfvev6NK8mM1Cgj2GhNqaKg8ojiu-RbZnJqWaUgmpDSrbMiPLQ1LFAzBczNVOuCUkAyGQhN1NQtjJBoLZ7H-Zckv20-5P2OpuS0iC2hrzgLv769PnfOc7p9u5QmlcGhU1HWSGfAAAUK4Mj2ji2Chgf8iwXCIc45n_7q5vAXSw2f7l0Nj4YKy8N87qzI8EjT_fR-9GeWZcySs9UM0VxCLskVTHeiqc4JkxUb16dSg5mOYZuSSVr14f5MLfx1gOe7Fx8p_TGjCrb1tP_96a2Taev_3LsHb9m9b838wX653p1RNU20Sru-jNUvPfe8bUkcdR0N39DbXp9O9iluVcnl1agKrsc_OUziS5cITFDm7NYAcpU-jdEzR9iI6nnUxEeD-TKpX1EQ2m78WI92j2F-ooOlsjE5hIoQh1URZ1kcyM6sWCPcN0XdiLRxPRJO9n4ooaTRKoJo50YxQYrkh5qNMTCBugpygDY3O-2fgErgH07Iu5MG_ZsoPqRIqjnrhw7Ogczb6aAKnIVRiqCAtDPPIQFI2nklwG87P2CjjhwM-FI7cLpfE7B0fhoXAqg_Pdnpxuz64483zUQLVNkIoA-1jw-5xjUFRUpSTk4UOCMpbOW_uzIKcUoDAqlkfBdaAregE6dcBFMyzPoLmn2ImOD2TzbaUA01D7WZFgT2WsUBJlQS5JlSJUdX8XQVhDcF0c0fkXsKdbe4eOk-5l2SzLMxyUlTJoNhpoca_9ZBdVt4itnyqwAgVdLOfLfouCoyJUdV3-FjYJaoLs2IgEj3HSE3_0kMwihzwVg4qm2Fg0yfLM79uPsYCNzXljbx8dzJj1OfP9XntqDfix5wJ8AKWKXtKc-brNZgbv8EyzsQqIDAFNExUd1RvxtlMmQjSeivWMQN3f5WoRXJrlmdabfWOnjp4eticXjKW_0pSEBzNJ7j4_JmplqAmK_COZVkXlZ9gjjVbUvMvS4J1s4i7PoOoc-nUL-OOilpdL42qK7KYpNBY4IS7SPFL01F3tCZQkJSdlCLYAfFpRSkUIs10Ci8UGWgbByr4odJ9tBNRhtM8A1GOpXQQfVbGQhyoIFqRwNi1H1OaR3y6Jg2JZyMruGzxJSOopWsnri7grYklRQMFDnCvh7Z6wLENrPjWPHh6oMPRS0nMXITdSCLwuQWkHvUY02oVqrquSv3bRrV8gjN9FFl2p0UCnA7M1t8nCne3h02rGYDv8qDSuxssJGOdzU7g6qXISz6DqLL5UCPOAD0CzvmQcTqNP_dPmcWvppXXh1sq4XGZKk2rOgjCk7A9YRxBtwbqs0L-pgCMdlJL4Rn4gdBwHc3a2QbQ9jXHfHc2Y29JQBYD6RfN4Fi1QzVcfjLfm4QPz87GzNRlme8haBc_M2Q_wwg21zL3mcXmqOOPKDEMMKMfLoHIADwVUpVUQs7R0og8dGvajGJZ7kQyMJxNBPGKp5l4GzBA4EdkmNh7tV-zN9mhn_WU8EC4kmbJVGoPw5khiEI9AqQgCQiy-nt3l-FCMOkm0liH3E2FGZT1SExo-GRy3_dZ0Y0U0A_i8tHQozAUddbr7anS3o3U6cTdfh7gF_RTN9bOngQ5nl_oSbHSqj9k9vPXMJ7tnl7vHwB8J4vJqPzLO7xtn63i6NwAdA0Kh4EFV0IAA2lABylpGWSxDQwMHyoH9JUetHjzTASV4whvVrVCj7jt4z4fDhMNHIPukDDUT4FVpdGa8nTPPfzI-3--OFrBVj7LMIGLmXvFFcITLrRJqJnjQnJ-1CYEOdGSSTUYiuBC0GuvqQCC6kwixKq3d9_7KAs1dNCnFuW3hL_UG6JgLw8cYV5fv0OCW1rUxu7Qh2Wes5BxNCcNbKxfqY-GX6AoNgxjW0EkcWmqu5bHEPjwTDIrAtUXzxe22Z7CjrXFG2LMwDdoCmuWtoAVb1RkXOkH38FxLYTsPq1DoFANqqW-4hVYPtnDmBrVo9yELVSi9h5oHSEZ7QpYT3gNhfhqFH5tmqw7_N2ohKNoycMbPBr-Q4LgYhYt0hUyBAoIlPqZyCst8oR2FKSB3yCoDl6Ggl3QopkRh0cYIEgQXPSJRgm4Q7NNtlhKFL2w8KeNuYvY6QdGIJ7gzSTYERXK8nckR0g7ZJ6EwDIdLoUCEPeJ27Nl_p-ttv8LpYmNjcPslVhLw3mWDS6av0ZSP2WNdFA3qMpS7lssEyzBl0mGHRQoNWw6gYOr9X6ASiSwZSOsEnHBE8sUKjYB7A9DPtMs4zcf2UnOdQobFDDasDBi9MUPd3JPEV6K7VUZ30aQNm4jeWsbSXhZ1f7xWgRO8RpqKN25P4LKYQjuW8fSG6S3bRjp5ayNxU-1Iey5xSTDxrC8ehgsHD3GSrFEMDsho7WXk1vqI5raNraXoXzF2LHNRRjkfN3oIYxSxGK2JkobpZadpF8duBMZAX4WnCc6VQRoHQ5qYJCMI5Yi97ZhsB_HOwHi9G44PeUa4bB1ciwxM8H2yH7vB0EWw9GgthjW_RlWo6mSxROjCXAj8zIYtuW4qEAjBJTsvc0P6ZhC4UjSJk33l0q0QXJLCuRC0yBOE4I8hSXYGKY1FVjwdFoZZd_B6C3zIjSAsxS_8H-BfAAAA__8i2Jrj">Kroki 在线预览</a>
+        </p>
+        <div class="svg-wrapper">
+            <object data="ragflow-import-pipeline.svg" type="image/svg+xml">
+                <img src="ragflow-import-pipeline.svg" alt="RAGFlow 数据导入与处理管道架构图">
+            </object>
+        </div>
+        <div class="meta">
+            <div class="chip"><strong>📁 本地路径</strong> diagrams/ragflow-import-pipeline.svg</div>
+            <div class="chip"><strong>🌐 Kroki URL</strong> <a href="https://kroki.io/mermaid/svg/eJyMV1tT20gWfvev6NK8mM1Cgj2GhNqaKg8ojiu-RbZnJqWaUgmpDSrbMiPLQ1LFAzBczNVOuCUkAyGQhN1NQtjJBoLZ7H-Zckv20-5P2OpuS0iC2hrzgLv769PnfOc7p9u5QmlcGhU1HWSGfAAAUK4Mj2ji2Chgf8iwXCIc45n_7q5vAXSw2f7l0Nj4YKy8N87qzI8EjT_fR-9GeWZcySs9UM0VxCLskVTHeiqc4JkxUb16dSg5mOYZuSSVr14f5MLfx1gOe7Fx8p_TGjCrb1tP_96a2Taev_3LsHb9m9b838wX653p1RNU20Sru-jNUvPfe8bUkcdR0N39DbXp9O9iluVcnl1agKrsc_OUziS5cITFDm7NYAcpU-jdEzR9iI6nnUxEeD-TKpX1EQ2m78WI92j2F-ooOlsjE5hIoQh1URZ1kcyM6sWCPcN0XdiLRxPRJO9n4ooaTRKoJo50YxQYrkh5qNMTCBugpygDY3O-2fgErgH07Iu5MG_ZsoPqRIqjnrhw7Ogczb6aAKnIVRiqCAtDPPIQFI2nklwG87P2CjjhwM-FI7cLpfE7B0fhoXAqg_Pdnpxuz64483zUQLVNkIoA-1jw-9xjUFRUpSTk4UOCMpbOW_uzIKcUoDAqlkfBdaAregE6dcBFMyzPoLmn2ImOD2TzbaUA01D7WZFgT2WsUBJlQS5JlSJUdX8XQVhD5K7SxYtf0ZOF9ssf3ndr5xGLuqNbf1du_zHv9bO-Ottrp3dY7S4mSzlZLIxAPZfjtM5Oc-HUYJrnR2rFizAedTqZHOZmbCJRYwu1fXWsJ7_Y-WyvZqHqFt7c4sneB2N3xdz9gI4fWe03D00N1baIq1R0sbRSKSs5qxLEswjme7muVXGRuV1L6JzHC1V0XkefDJ_xqR_4LYQNRR41DLV2P2s_wK0WIVPj9Huo1cp2U8DacQnW4NREHR_cNY9nqTtzvj9qT82bH884y4HlqShzDMN6dI6H2OX1L59aUxQ5X9KHMD2PnCw1cG2pw5IP0fmuNfkCeB3mtAzlm3ijBVqCR5vtz18Q9vQD47d3ra_vEHqB9o_Nq5ft6fn28lPzt6Vm-TuhOw6ytVynzlTMr8_N5io--rV1ulCqPwpk0n53Wvj4mjRuHj6jDSG4cMqIBrWoRF54n3_muAXHc_0FmB3h9y85PpV-eH--5yPJUEqswlU-6QHOxbje7ba2VtHz2dabf0K45bmDfM_gM-htCzPBbG54u7Vx7Lyag4KO65pgbY9p6pDsw5CyDmwLX1snC3jLuONnQZX1U4x-xvOL7c3PrZnViiSJpCBFOMYSyITLVrEGbJaCqPM-rEA7eFF2qFkrlM0yCsLbJpOdO0Vj9kjYEpSUdiiMG_Mz1mVhNZcNjyG_vMYJFps2CvB62YC-x3w2eFLbGkCyYtl9cLj_2rsPpBkogRvv2c3kyU2yVjVs7nzZ__8fAAD__5GdCAc" style="color:#64b5f6">在线链接</a></div>
+            <div class="chip"><strong>📐 格式</strong> SVG (Kroki/Mermaid)</div>
+        </div>
+    </div>
+</body>
+</html>

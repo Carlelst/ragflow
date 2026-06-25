@@ -301,8 +301,8 @@ def load_yaml_config(path):
 # ══════════════════════════════════════════════════════════════════════
 
 def new_uuid():
-    h = ''.join(random.choices(string.hexdigits, k=32))
-    return ''.join([h[:8], h[8:12], h[12:16], h[16:20], h[20:]])
+    import uuid
+    return str(uuid.uuid1()).replace("-", "")
 
 
 def fetch_rows(pg_config, source_table, limit=0, doc_id=0):
@@ -358,7 +358,6 @@ def build_parser_config(chunk_token_num, graphrag_cfg=None, raptor_cfg=None, ext
     cfg = {
         "chunk_token_num": chunk_token_num,
         "delimiter": extra_cfg.get("delimiter", "\n"),
-        "overlapped_percent": extra_cfg.get("overlapped_percent", 10),
     }
 
     # 子文本块
@@ -419,24 +418,33 @@ def build_parser_config(chunk_token_num, graphrag_cfg=None, raptor_cfg=None, ext
 # ══════════════════════════════════════════════════════════════════════
 
 def ensure_kb(tenant_id, kb_name, embd_id, chunk_token_num, graphrag_cfg=None, raptor_cfg=None):
+    """通过 RAGFlow REST API 创建/获取知识库，确保前端兼容"""
     from api.db.db_models import Tenant
     from api.db.services.knowledgebase_service import KnowledgebaseService
-    from common.constants import ParserType
 
     kb = KnowledgebaseService.query(name=kb_name, tenant_id=tenant_id)
     if kb:
         return kb[0]
 
-    kb_id = new_uuid()
     tenant = Tenant.get_by_id(tenant_id)
-    KnowledgebaseService.save(**{
-        "id": kb_id, "tenant_id": tenant_id, "name": kb_name,
-        "created_by": tenant_id,
-        "embd_id": embd_id or tenant.embd_id,
-        "parser_id": ParserType.NAIVE.value,
+    embd = (embd_id or tenant.embd_id).replace("___", "@")
+
+    payload = {
+        "name": kb_name,
+        "embedding_model": embd,
+        "chunk_method": "naive",
         "parser_config": build_parser_config(chunk_token_num, graphrag_cfg, raptor_cfg),
-        "pipeline_id": "",
-    })
+    }
+
+    import requests
+    api_url = "http://127.0.0.1/api/v1/datasets"
+    api_key = os.environ.get("RAGFLOW_API_KEY", "ragflow-307044760fae4f548209426ba6191d9e")
+    resp = requests.post(api_url, json=payload,
+                         headers={"Authorization": f"Bearer {api_key}"}, timeout=30)
+    data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(f"API create KB failed: {data.get('message', resp.text)}")
+    kb_id = data["data"]["id"]
     return KnowledgebaseService.get_by_id(kb_id)[1]
 
 
@@ -606,10 +614,10 @@ def wait_for_parse(kb_id, doc_ids, timeout=3600, poll_interval=10):
             time.sleep(poll_interval)
             continue
 
-        done = sum(1 for d in docs if d.run == "3")
-        fail = sum(1 for d in docs if d.run == "4")
-        processing = sum(1 for d in docs if d.run in ("0", "1"))
         total = len(docs)
+        done = sum(1 for d in docs if d.progress >= 1.0)
+        fail = sum(1 for d in docs if d.progress < 0)
+        processing = total - done - fail
         elapsed = time.time() - started
 
         print(f"\r  progress: done={done} fail={fail} pending={processing}/{total} ({elapsed:.0f}s)", end="", flush=True)
