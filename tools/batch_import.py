@@ -188,7 +188,7 @@ SOURCE_CONFIGS = {
         "default_chunk_t": 512,
     },
     "wangpan": {
-        "kb_name": "enflame-wangpan",
+        "kb_name": "enflame-pan",
         "source_table": "wangpan_metadata",
         "description": "企业网盘文件",
         "default_chunk_tokens": 512,
@@ -716,6 +716,14 @@ def import_source(source_key, tenant_id, args):
     if not rows:
         print(f"  无数据，跳过\n")
         return kb.id, 0
+
+    # wangpan 源：实际内容是 local_file_path 的 .md 文件，替换 minio_key
+    if source_key == "wangpan":
+        for r in rows:
+            if r.get("local_file_path"):
+                r["minio_key"] = r["local_file_path"]
+                # 更新 file_hash 用 md 文件路径重新计算
+                r["file_hash"] = r.get("local_md5") or r.get("file_hash", "")
 
     # Step 3: 增量对比 & 导入
     print(f"\n增量分析...")
