@@ -1,0 +1,45 @@
+{
+  "_comment": "RAGFlow Dify Proxy 配置文件 — 此文件持久化，优先级高于代码默认值。环境变量可覆盖。",
+
+  "ragflow": {
+    "base_url": "http://127.0.0.1:8088",
+    "api_key": "ragflow-307044760fae4f548209426ba6191d9e"
+  },
+
+  "dify": {
+    "console_base": "http://10.9.200.13:8086"
+  },
+
+  "retrieval": {
+    "default_top_k": 10,
+    "request_timeout": 90,
+    "connect_timeout": 5
+  },
+
+  "pool": {
+    "max_connections": 200,
+    "max_keepalive": 50,
+    "retry_max": 2
+  },
+
+  "cache": {
+    "ttl_seconds": 60,
+    "size": 2000,
+    "redis_url": "redis://:difyai123456@dify-redis-1:6379/2"
+  },
+
+  "circuit_breaker": {
+    "fail_threshold": 5,
+    "cooldown_seconds": 30,
+    "half_open_max": 1
+  },
+
+  "feedback": {
+    "root_dir": "/home/ai.hse",
+    "file": "rag-feedback.jsonl"
+  },
+
+  "monitoring": {
+    "slow_threshold_seconds": 5.0
+  }
+}
