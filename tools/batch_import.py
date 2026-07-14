@@ -176,19 +176,19 @@ def enrich_markdown_images(minio_client, bucket, minio_key, source_url, image_ur
 
 SOURCE_CONFIGS = {
     "wiki": {
-        "kb_name": "enflame-wiki",
+        "kb_name": "ekb_wiki",
         "source_table": "wiki_metadata",
         "description": "Confluence Wiki 文档",
         "default_chunk_tokens": 256,
     },
     "html": {
-        "kb_name": "enflame-docs",
+        "kb_name": "ekb_docs",
         "source_table": "html_metadata",
         "description": "文档站 HTML 内容",
         "default_chunk_t": 512,
     },
     "wangpan": {
-        "kb_name": "enflame-pan",
+        "kb_name": "ekb_pan",
         "source_table": "wangpan_metadata",
         "description": "企业网盘文件",
         "default_chunk_tokens": 512,
@@ -305,7 +305,7 @@ def new_uuid():
     return str(uuid.uuid1()).replace("-", "")
 
 
-def fetch_rows(pg_config, source_table, limit=0, doc_id=0):
+def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None):
     import psycopg2, psycopg2.extras
     conn = psycopg2.connect(**pg_config)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -313,13 +313,54 @@ def fetch_rows(pg_config, source_table, limit=0, doc_id=0):
         query = f"SELECT * FROM {source_table} WHERE id = %s"
         cur.execute(query, (doc_id,))
     else:
-        query = f"SELECT * FROM {source_table} ORDER BY id"
+        query = f"SELECT * FROM {source_table}"
+        where = []
+        if project_filter and source_table in ("wiki_metadata", "wangpan_metadata"):
+            if project_filter == "other":
+                where.append("minio_key NOT LIKE '%4.0%' AND minio_key NOT LIKE '%4.5%' AND minio_key NOT LIKE '%5.0%'")
+                if source_table == "wiki_metadata":
+                    where.append("wiki_path::text NOT ILIKE '%libra%'")
+            elif project_filter == "libra":
+                if source_table == "wangpan_metadata":
+                    where.append("(minio_key ILIKE '%/libra/%' OR minio_key ILIKE '%/libra.%')")
+                    where.append("minio_key NOT ILIKE '%libra-%' AND minio_key NOT ILIKE '%libra_h%'")
+                else:
+                    where.append("wiki_path::text ILIKE '%libra%' AND wiki_path::text NOT ILIKE '%libra-%' AND wiki_path::text NOT ILIKE '%libra_h%'")
+            elif project_filter == "libra_h":
+                if source_table == "wangpan_metadata":
+                    where.append("(minio_key ILIKE '%libra-%' OR minio_key ILIKE '%libra_h%')")
+                else:
+                    where.append("(wiki_path::text ILIKE '%libra-%' OR wiki_path::text ILIKE '%libra_h%')")
+            elif project_filter == "draco":
+                if source_table == "wangpan_metadata":
+                    where.append("minio_key ILIKE '%draco%'")
+                else:
+                    where.append("wiki_path::text ILIKE '%draco%'")
+            else:
+                ver = project_filter.replace("SIP", "")
+                where.append(f"minio_key LIKE '%{ver}%'")
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY id"
         if limit > 0:
             query += f" LIMIT {limit}"
         cur.execute(query)
     rows = cur.fetchall()
     cur.close(); conn.close()
     return rows
+
+
+def log_unmatched_pg(pg_config, source_table, matched_minio_keys, log_file):
+    """将未匹配的 PG 行写入 log 文件"""
+    import psycopg2
+    conn = psycopg2.connect(**pg_config)
+    cur = conn.cursor()
+    cur.execute(f"SELECT minio_key FROM {source_table} WHERE minio_key NOT IN %s ORDER BY minio_key",
+                (tuple(matched_minio_keys) if matched_minio_keys else ('',)))
+    with open(log_file, 'w') as f:
+        for (mk,) in cur:
+            f.write(mk + "\n")
+    cur.close(); conn.close()
 
 
 def infer_suffix(minio_key):
@@ -694,8 +735,16 @@ def import_source(source_key, tenant_id, args):
     }
 
     # Step 1: KB
-    print(f"\nKB '{cfg['kb_name']}'")
-    kb = ensure_kb(tenant_id, cfg["kb_name"], args.embd_id, chunk_tokens,
+    kb_name = cfg["kb_name"]
+    if getattr(args, 'project', None):
+        if args.project == "other":
+            kb_name = "ekb_wiki" if source_key == "wiki" else "ekb_pan"
+        else:
+            ver = args.project.replace("SIP", "")
+            suffix = "wiki" if source_key == "wiki" else ("pan" if source_key == "wangpan" else "docs")
+            kb_name = f"ekb_{ver}_{suffix}"
+    print(f"\nKB '{kb_name}'")
+    kb = ensure_kb(tenant_id, kb_name, args.embd_id, chunk_tokens,
                    graphrag_cfg, raptor_cfg)
     flags = " + ".join(filter(None, [
         "向量", "GraphRAG" if enable_graphrag else None,
@@ -711,7 +760,16 @@ def import_source(source_key, tenant_id, args):
         "password": args.pg_password or PG_DEFAULTS["password"],
         "dbname": args.pg_db or PG_DEFAULTS["dbname"],
     }
-    rows = fetch_rows(pg_config, cfg["source_table"], args.limit, args.doc_id)
+    rows = fetch_rows(pg_config, cfg["source_table"], args.limit, args.doc_id,
+                      project_filter=getattr(args, 'project', None))
+    if not rows and source_key in ("wiki", "wangpan"):
+        # Fallback: SIP4.0 → libra, SIP4.5 → libra_h, SIP5.0 → draco
+        fb_filters = {"SIP4.0": "libra", "SIP4.5": "libra_h", "SIP5.0": "draco"}
+        fb = fb_filters.get(getattr(args, 'project', ''))
+        if fb:
+            print(f"  project filter 无结果，fallback 到 {fb}")
+            rows = fetch_rows(pg_config, cfg["source_table"], args.limit, args.doc_id,
+                              project_filter=fb)
     print(f"\n{cfg['source_table']}: {len(rows)} 行")
     if not rows:
         print(f"  无数据，跳过\n")
@@ -906,6 +964,9 @@ def main():
     parser.add_argument("--source", default="wiki",
                         choices=["wiki", "html", "wangpan", "all"],
                         help="数据源 (默认: wiki)")
+    parser.add_argument("--project", default=None,
+                        choices=["4.0", "4.5", "5.0"],
+                        help="按版本号过滤数据")
     parser.add_argument("--limit", type=int, default=0,
                         help="每个数据源的导入上限 (0=全部)")
     parser.add_argument("--doc-id", type=int, default=0,

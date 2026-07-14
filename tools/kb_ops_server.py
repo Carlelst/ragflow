@@ -63,8 +63,11 @@ def api_import():
     source = body.get("source", "wiki")
     doc_id = body.get("doc_id", 0)
     wait = body.get("wait", True)
+    project = body.get("project", "")  # SIP4.0, SIP4.5, SIP5.0, other
 
-    task_id = f"import_{source}_{doc_id}"
+    task_id = f"import_{source}_{doc_id}" if not project else f"import_{source}_{project}"
+    # Allow multiple project imports to run in parallel
+    task_suffix = f"_{source}_{project}" if project else f"_{source}_{doc_id}"
     with _lock:
         if task_id in _tasks and _tasks[task_id]["status"] == "running":
             return jsonify({"task_id": task_id, "status": "already_running"}), 409
@@ -78,6 +81,8 @@ def api_import():
             "--config", f"{CONTAINER_TOOLS}/batch_config.yaml",
             "--source", source,
         ]
+        if project:
+            cmd += ["--project", project]
         if doc_id:
             cmd += ["--doc-id", str(doc_id)]
         if wait:

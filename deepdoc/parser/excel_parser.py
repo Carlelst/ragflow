@@ -202,10 +202,56 @@ class RAGFlowExcelParser:
         return list(ws.iter_rows(min_row=1, max_row=actual_rows))
 
     def html(self, fnm, chunk_rows=256):
+        import pandas as pd
         from html import escape
 
         file_like_object = BytesIO(fnm) if not isinstance(fnm, str) else fnm
-        wb = RAGFlowExcelParser._load_excel_to_workbook(file_like_object)
+        tb_chunks = []
+
+        def _fmt_str(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return ""
+            return str(v).strip()
+
+        def _build_chunk(sheetname, header_row, data_rows):
+            tb = "<table><caption>" + escape(sheetname) + "</caption>"
+            tb += "<tr>"
+            for v in header_row:
+                tb += "<th>" + escape(_fmt_str(v)) + "</th>"
+            tb += "</tr>"
+            for row_values in data_rows:
+                tb += "<tr>"
+                for v in row_values:
+                    tb += "<td>" + escape(_fmt_str(v)) + "</td>"
+                tb += "</tr>"
+            tb += "</table>\n"
+            return tb
+
+        try:
+            dfs = pd.read_excel(file_like_object, sheet_name=None, dtype=str)
+        except Exception as e:
+            logging.warning(f"pandas read_excel failed (falling back to openpyxl): {e}")
+            return self._html_openpyxl(fnm, chunk_rows)
+
+        for sheetname, df in dfs.items():
+            if df.empty:
+                continue
+            df = df.fillna("")
+            header = list(df.columns)
+            data = df.values.tolist()
+            n_data = len(data)
+            for chunk_i in range((n_data + chunk_rows - 1) // chunk_rows):
+                start = chunk_i * chunk_rows
+                end = min(start + chunk_rows, n_data)
+                tb = _build_chunk(sheetname, header, data[start:end])
+                tb_chunks.append(tb)
+
+        return tb_chunks
+
+    def _html_openpyxl(self, fnm, chunk_rows=256):
+        from html import escape
+
+        wb = self._load_excel_to_workbook(BytesIO(fnm) if not isinstance(fnm, str) else fnm)
         tb_chunks = []
 
         def _fmt(v):
@@ -216,7 +262,7 @@ class RAGFlowExcelParser:
         for sheetname in wb.sheetnames:
             ws = wb[sheetname]
             try:
-                rows = RAGFlowExcelParser._get_rows_limited(ws)
+                rows = self._get_rows_limited(ws)
             except Exception as e:
                 logging.warning(f"Skip sheet '{sheetname}' due to rows access error: {e}")
                 continue
@@ -229,10 +275,6 @@ class RAGFlowExcelParser:
                 tb_rows_0 += f"<th>{escape(_fmt(t.value))}</th>"
             tb_rows_0 += "</tr>"
 
-            # rows[0] is the header; split the remaining data rows into
-            # ceil(n_data / chunk_rows) chunks. Using +1 here over-counts by one
-            # when the data-row count is an exact multiple of chunk_rows and emits
-            # a spurious header-only chunk.
             n_data_rows = len(rows) - 1
             for chunk_i in range((n_data_rows + chunk_rows - 1) // chunk_rows):
                 tb = ""
