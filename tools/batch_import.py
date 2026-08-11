@@ -129,6 +129,74 @@ def _build_pg_meta(row, source_key):
         meta["last_updated"] = lu.isoformat() if hasattr(lu, "isoformat") else str(lu)
     return {k: v for k, v in meta.items() if v}
 
+def read_first_line(minio_client, bucket, minio_key, max_bytes=4096):
+    """读取 MinIO 对象的第一行文本。md 直接读; 返回第一行(去换行)或 None。"""
+    ext = minio_key.rsplit('.', 1)[-1].lower() if '.' in minio_key else ''
+    if ext not in ("md", "markdown", "txt"):
+        return None  # xlsx 等二进制暂不支持跨 project 标记
+    try:
+        obj = minio_client.get_object(bucket, minio_key)
+        data = obj.read(max_bytes)
+        obj.close(); obj.release_conn()
+        text = data.decode("utf-8", errors="replace")
+        first_line = text.splitlines()[0] if text.splitlines() else text
+        return first_line.strip()
+    except Exception as e:
+        print(f"[EKBTAG] read_first_line fail {minio_key}: {e}")
+        return None
+
+
+EKB_TAG_RE = re.compile(r'【\s*EKB[_\-]?\s*([0-9.]+)\s*】', re.IGNORECASE)
+
+
+def extract_ekb_tags(minio_client, bucket, minio_key):
+    """解析文档第一行的【EKB_X.Y】标记，返回排序后的版本号列表（去重）。
+    md 才解析; xlsx 或读失败返回 []（走 PG project_name 兜底）。"""
+    fl = read_first_line(minio_client, bucket, minio_key)
+    if not fl:
+        return []
+    tags = []
+    seen = set()
+    for m in EKB_TAG_RE.findall(fl):
+        v = m.strip()
+        if v and v not in seen:
+            seen.add(v)
+            tags.append(v)
+    return sorted(tags)
+
+
+def build_full_meta(row, source_key, pg_project):
+    """组装完整 doc metadata：基础 PG 字段 + project 关联。"""
+    meta = _build_pg_meta(row, source_key)
+    meta["project_name"] = pg_project  # 恒等于 PG project_name
+    meta["project_tags"] = [pg_project]  # 无标记默认单一主标记
+    meta["related_projects"] = []
+    return meta
+
+
+def enrich_project_meta(meta, tags, pg_project):
+    """按解析到的 EKB 标记覆盖 project 关联。
+    有标记 → 全量覆盖 project_tags；related = tags - main。
+    无标记 → 保持默认 (仅 main)。"""
+    if not tags:
+        return meta
+    meta["project_tags"] = sorted(tags)
+    related = sorted(t for t in tags if t != pg_project)
+    meta["related_projects"] = related
+    return meta
+
+
+def log_ekb_anomaly(row, pb, tags, log_path, source_key):
+    """记录『有 EKB 标记但不含 PG project_name』的文档，供人工找文档所属人修改。"""
+    try:
+        line = (f"{datetime.now().isoformat()} | source={source_key} | "
+                f"name={row.get('title') or row.get('wangpan_file_name') or ''} | "
+                f"minio_key={row.get('minio_key')} | pg_project={pb} | tags={tags}\n")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        print(f"[EKBTAG] log anomaly fail: {e}")
+
 
 def enrich_markdown_images(minio_client, bucket, minio_key, source_url, image_urls=None):
     """
@@ -490,7 +558,8 @@ def ensure_kb(tenant_id, kb_name, embd_id, chunk_token_num, graphrag_cfg=None, r
 
 
 def insert_one_document(kb_id, tenant_id, row, chunk_token_num,
-                        graphrag_cfg=None, raptor_cfg=None, minio_config=None):
+                        graphrag_cfg=None, raptor_cfg=None, minio_config=None,
+                        meta=None):
     from api.db.services.document_service import DocumentService
     from api.db.services.file_service import FileService
     from api.db.services.file2document_service import File2DocumentService
@@ -540,6 +609,14 @@ def insert_one_document(kb_id, tenant_id, row, chunk_token_num,
         "file_id": file_id,
         "document_id": doc_id,
     })
+
+    # 写入文档级元数据 (doc_meta ES 索引)，供检索 enrich 附加到每个 chunk
+    if meta:
+        try:
+            from api.db.services.doc_metadata_service import DocMetadataService
+            DocMetadataService.update_document_metadata(doc_id, meta)
+        except Exception as e:
+            print(f"  [META] 写元数据失败 {name[:50]}: {e}")
 
     return doc_id
 
@@ -810,6 +887,15 @@ def import_source(source_key, tenant_id, args):
     print(f"  外部: {len(rows)} | 已有: {len(existing)}")
     print(f"  新增: {len(new_rows)} | 变更: {len(changed_rows)} | 未变: {unchanged} | 删除: {len(deleted_docs)}")
 
+    # MinIO client 复用（读首行解析 EKB 标记）
+    minio_client = Minio(minio_config["host"], access_key=minio_config["user"],
+                         secret_key=minio_config["password"],
+                         secure=minio_config.get("secure", False))
+    bucket = minio_config.get("bucket", MINIO_DEFAULTS["bucket"])
+    # 主 project 以 PG project_name / --project 为基准；不取标记里的第一个
+    pg_project = getattr(args, 'project', None) or "4.5"
+    ekb_anomaly_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ekb_anomalies.log")
+
     # 删除已不存在于外部的文档 (仅在无 limit 全量同步时)
     if deleted_docs and args.limit == 0:
         print(f"\n  删除 {len(deleted_docs)} 篇...")
@@ -834,6 +920,20 @@ def import_source(source_key, tenant_id, args):
                 token_num=0,
             ).where(Document.id == old_doc.id).execute()
             print(f"    ~ {old_doc.name[:50]}")
+            # 重建文档级元数据（覆盖 project 关联，含新解析的 EKB 标记）
+            try:
+                _tags = extract_ekb_tags(minio_client, bucket, ext_row['minio_key'])
+                if _tags and pg_project not in _tags:
+                    log_ekb_anomaly(ext_row, pg_project, _tags, ekb_anomaly_log, source_key)
+                    print(f"  [EKBTAG] 更新跳过元数据 {old_doc.name[:50]} "
+                          f"(PG={pg_project}, 标记={_tags}) → 见 ekb_anomalies.log")
+                    continue
+                _meta = enrich_project_meta(build_full_meta(ext_row, source_key, pg_project),
+                                            _tags, pg_project)
+                from api.db.services.doc_metadata_service import DocMetadataService
+                DocMetadataService.update_document_metadata(old_doc.id, _meta)
+            except Exception as _e:
+                print(f"  [META] 更新元数据失败 {old_doc.name[:50]}: {_e}")
 
     # 导入新文档
     print(f"\n导入 {len(new_rows)} 篇...")
@@ -841,8 +941,22 @@ def import_source(source_key, tenant_id, args):
     doc_ids = []
     for _k, row in new_rows:
         try:
+            # 解析文档第一行 EKB 标记 (仅 md；xlsx 跳过走兜底)
+            tags = extract_ekb_tags(minio_client, bucket, row['minio_key'])
+            if tags and pg_project not in tags:
+                # 有标记但不含主 project → 异常，记录并跳过（不静默入库）
+                log_ekb_anomaly(row, pg_project, tags, ekb_anomaly_log, source_key)
+                print(f"  [EKBTAG] 跳过 {row.get('title') or row.get('wangpan_file_name', '')[:50]} "
+                      f"(PG={pg_project}, 标记={tags}) → 见 ekb_anomalies.log")
+                continue
+
+            # 组装完整元数据并注入 project 关联
+            meta = build_full_meta(row, source_key, pg_project)
+            meta = enrich_project_meta(meta, tags, pg_project)
+
             doc_id = insert_one_document(kb.id, tenant_id, row, chunk_tokens,
-                                         graphrag_cfg, raptor_cfg, minio_config)
+                                         graphrag_cfg, raptor_cfg, minio_config,
+                                         meta=meta)
             doc_ids.append(doc_id)
         except Exception as e:
             print(f"  FAIL: {str(e)[:60]}")
