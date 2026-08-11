@@ -406,7 +406,8 @@ def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None):
                     where.append("wiki_path::text ILIKE '%draco%'")
             else:
                 ver = project_filter.replace("SIP", "")
-                where.append(f"minio_key LIKE '%{ver}%'")
+                where.append(f"project_name = '{ver}'")
+                where.append("status = 'processed'")
         if where:
             query += " WHERE " + " AND ".join(where)
         query += " ORDER BY id"
@@ -813,13 +814,18 @@ def import_source(source_key, tenant_id, args):
 
     # Step 1: KB
     kb_name = cfg["kb_name"]
-    if getattr(args, 'project', None):
+    if getattr(args, 'kb_name', None):
+        kb_name = args.kb_name
+    elif getattr(args, 'project', None):
         if args.project == "other":
             kb_name = "ekb_wiki" if source_key == "wiki" else "ekb_pan"
         else:
             ver = args.project.replace("SIP", "")
             suffix = "wiki" if source_key == "wiki" else ("pan" if source_key == "wangpan" else "docs")
             kb_name = f"ekb_{ver}_{suffix}"
+    if getattr(args, 'dev', False):
+        if not kb_name.endswith("_dev"):
+            kb_name = kb_name + "_dev"
     print(f"\nKB '{kb_name}'")
     kb = ensure_kb(tenant_id, kb_name, args.embd_id, chunk_tokens,
                    graphrag_cfg, raptor_cfg)
@@ -1087,6 +1093,10 @@ def main():
                         help="只导入指定 PG ID 的文档（用于单篇测试）")
     parser.add_argument("--status", action="store_true",
                         help="查看所有KB状态")
+    parser.add_argument("--kb-name", default=None,
+                        help="覆盖自动生成的 KB 名")
+    parser.add_argument("--dev", action="store_true",
+                        help="导入到 _dev 后缀的 KB（如 ekb_4.5_wiki_dev）")
 
     # RAGFlow
     parser.add_argument("--tenant-id", default=None)
