@@ -858,13 +858,13 @@ def import_source(source_key, tenant_id, args):
         print(f"  无数据，跳过\n")
         return kb.id, 0
 
-    # wangpan 源：实际内容是 local_file_path 的 .md 文件，替换 minio_key
+    # wangpan 源：MinIO 实际路径是 PG 原始 minio_key (4.5/wangpan/...)
+    # local_file_path (wangpan/4.5/...) 前缀顺序不同，在 MinIO 不存在，勿覆盖
+    # file_hash 用 local_md5 做变更检测
     if source_key == "wangpan":
         for r in rows:
-            if r.get("local_file_path"):
-                r["minio_key"] = r["local_file_path"]
-                # 更新 file_hash 用 md 文件路径重新计算
-                r["file_hash"] = r.get("local_md5") or r.get("file_hash", "")
+            if r.get("local_md5"):
+                r["file_hash"] = r["local_md5"]
 
     # Step 3: 增量对比 & 导入
     print(f"\n增量分析...")
