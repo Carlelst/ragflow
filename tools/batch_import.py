@@ -269,7 +269,7 @@ SOURCE_CONFIGS = {
         "kb_name": "ekb_docs",
         "source_table": "html_metadata",
         "description": "文档站 HTML 内容",
-        "default_chunk_t": 512,
+        "default_chunk_tokens": 512,
     },
     "wangpan": {
         "kb_name": "ekb_pan",
