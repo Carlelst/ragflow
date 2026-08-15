@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 8192
 
 
+def _guard_leading_import(text: str) -> str:
+    """Work around a vLLM qwen3-vl-embedding-8b numerical bug.
+
+    That model returns a NaN vector (HTTP 400 ``Out of range float values are
+    not JSON compliant: nan``) whenever the input text begins with the lowercase
+    token ``import`` — e.g. SystemVerilog DPI declarations like
+    ``import "DPI" function uint8_t sm4_xts_enc(...);``. Prefixing a single
+    space moves ``import`` off the first-token position and yields a valid
+    vector with negligible semantic drift.
+
+    Applied to both indexing (``encode``) and retrieval (``encode_queries``)
+    inputs via :meth:`Base._batched_encode`, so any future document chunk or
+    query that happens to start with ``import`` is guarded too.
+    """
+    if text.startswith("import"):
+        return " " + text
+    return text
+
+
 class EmbeddingError(ModelException):
     """Raised when an embedding provider fails to return usable embeddings.
 
@@ -176,6 +195,7 @@ class Base(ABC):
         """
         if truncate_to is not None:
             texts = [truncate(t, truncate_to) for t in texts]
+        texts = [_guard_leading_import(t) for t in texts]
         vectors = []
         token_count = 0
         for i in range(0, len(texts), batch_size):
