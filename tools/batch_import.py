@@ -478,6 +478,42 @@ def get_minio_size(minio_config, bucket, key):
             return 0
 
 
+# create 路径 (POST /api/v1/datasets) 用 exclude_unset=False 做 model_dump,
+# 会把 ParserConfig 里这些带默认值的字段(多为 None/空)也 dump 进 DB。
+# 其中 table_column_mode/names/roles 值为 null,撞上前端 zod 的 .optional()
+# (只接受 undefined 不接受 null),导致浏览器里 KB 点保存时 form.trigger() 静默失败。
+# pan_dev/wiki_dev 无这些字段(前端保存走 update 路径 exclude_unset=True),故能正常保存。
+_PARSER_CONFIG_LEAK_KEYS = (
+    "table_column_mode",
+    "table_column_names",
+    "table_column_roles",
+    "pages",
+    "task_page_size",
+    "filename_embd_weight",
+    "ext",
+    "tag_kb_ids",
+    "compilation_template_group_id",
+)
+
+
+def _strip_parser_config_leaks(kb):
+    """删除 create 路径泄漏进 parser_config 的 ParserConfig 默认值字段,使 KB 与前端保存的 pan_dev 对齐。"""
+    from api.db.services.knowledgebase_service import KnowledgebaseService
+
+    pc = kb.parser_config or {}
+    if not pc:
+        return kb
+    changed = False
+    for key in _PARSER_CONFIG_LEAK_KEYS:
+        if key in pc:
+            pc.pop(key)
+            changed = True
+    if changed:
+        KnowledgebaseService.update_by_id(kb.id, {"parser_config": pc})
+        kb.parser_config = pc
+    return kb
+
+
 def build_parser_config(chunk_token_num, graphrag_cfg=None, raptor_cfg=None, extra_cfg=None):
     """构建 parser_config。
 
@@ -577,7 +613,10 @@ def ensure_kb(tenant_id, kb_name, embd_id, chunk_token_num, graphrag_cfg=None, r
     if data.get("code") != 0:
         raise Exception(f"API create KB failed: {data.get('message', resp.text)}")
     kb_id = data["data"]["id"]
-    return KnowledgebaseService.get_by_id(kb_id)[1]
+    kb = KnowledgebaseService.get_by_id(kb_id)[1]
+    # create 路径会把 ParserConfig 默认值字段(null)泄漏进 parser_config,
+    # 导致前端保存时 zod .optional() 校验失败。创建后清理,与前端保存的 KB 对齐。
+    return _strip_parser_config_leaks(kb)
 
 
 def insert_one_document(kb_id, tenant_id, row, chunk_token_num,
