@@ -124,6 +124,22 @@ def _build_pg_meta(row, source_key):
             v = row.get(pg_col)
             if v:
                 meta[label] = str(v)
+    elif source_key == "git":
+        for pg_col, label in [
+            ("repo_url", "repo_url"), ("branch", "branch"),
+            ("file_path", "file_path"), ("source_url", "source_url"),
+            ("commit_hash", "commit_hash"), ("author", "author"),
+        ]:
+            v = row.get(pg_col)
+            if v:
+                meta[label] = str(v)
+        cd = row.get("commit_date")
+        if cd:
+            meta["commit_date"] = cd.isoformat() if hasattr(cd, "isoformat") else str(cd)
+        # title 用 file_path 的 basename（git 表无 title 列）
+        fp = row.get("file_path")
+        if fp:
+            meta["title"] = fp.rsplit("/", 1)[-1]
     lu = row.get("last_updated")
     if lu:
         meta["last_updated"] = lu.isoformat() if hasattr(lu, "isoformat") else str(lu)
@@ -261,6 +277,12 @@ SOURCE_CONFIGS = {
         "description": "企业网盘文件",
         "default_chunk_tokens": 512,
     },
+    "git": {
+        "kb_name": "ekb_git",
+        "source_table": "git_metadata",
+        "description": "GitLab 仓库文档",
+        "default_chunk_tokens": 512,
+    },
 }
 
 # 外部数据源连接信息 — 命令行 / YAML 可覆盖
@@ -383,7 +405,7 @@ def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None):
     else:
         query = f"SELECT * FROM {source_table}"
         where = []
-        if project_filter and source_table in ("wiki_metadata", "wangpan_metadata"):
+        if project_filter and source_table in ("wiki_metadata", "wangpan_metadata", "git_metadata"):
             if project_filter == "other":
                 where.append("minio_key NOT LIKE '%4.0%' AND minio_key NOT LIKE '%4.5%' AND minio_key NOT LIKE '%5.0%'")
                 if source_table == "wiki_metadata":
@@ -407,7 +429,7 @@ def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None):
             else:
                 ver = project_filter.replace("SIP", "")
                 where.append(f"project_name = '{ver}'")
-                where.append("status = 'processed'")
+                where.append("status IN ('processed','uploaded')")
         if where:
             query += " WHERE " + " AND ".join(where)
         query += " ORDER BY id"
@@ -821,7 +843,7 @@ def import_source(source_key, tenant_id, args):
             kb_name = "ekb_wiki" if source_key == "wiki" else "ekb_pan"
         else:
             ver = args.project.replace("SIP", "")
-            suffix = "wiki" if source_key == "wiki" else ("pan" if source_key == "wangpan" else "docs")
+            suffix = "wiki" if source_key == "wiki" else ("pan" if source_key == "wangpan" else ("docs" if source_key == "html" else "git"))
             kb_name = f"ekb_{ver}_{suffix}"
     if getattr(args, 'dev', False):
         if not kb_name.endswith("_dev"):
@@ -1082,7 +1104,7 @@ def main():
                         help="YAML 配置文件路径")
 
     parser.add_argument("--source", default="wiki",
-                        choices=["wiki", "html", "wangpan", "all"],
+                        choices=["wiki", "html", "wangpan", "git", "all"],
                         help="数据源 (默认: wiki)")
     parser.add_argument("--project", default=None,
                         choices=["4.0", "4.5", "5.0"],
@@ -1182,7 +1204,7 @@ def main():
         return
 
     # ── 确定数据源 ───────────────────────────────────────────────
-    sources = ["wiki", "html", "wangpan"] if args.source == "all" else [args.source]
+    sources = ["wiki", "html", "wangpan", "git"] if args.source == "all" else [args.source]
 
     # ── 逐个导入 ─────────────────────────────────────────────────
     results = {}
