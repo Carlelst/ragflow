@@ -140,6 +140,17 @@ def _build_pg_meta(row, source_key):
         fp = row.get("file_path")
         if fp:
             meta["title"] = fp.rsplit("/", 1)[-1]
+    elif source_key == "local":
+        # local_metadata: docx→md 转换的本地文档
+        for pg_col, label in [
+            ("local_file_name", "original_file_name"),
+            ("local_file_path", "original_file_path"),
+            ("content_type", "content_type"),
+            ("task_id", "task_id"),
+        ]:
+            v = row.get(pg_col)
+            if v:
+                meta[label] = str(v)
     lu = row.get("last_updated")
     if lu:
         meta["last_updated"] = lu.isoformat() if hasattr(lu, "isoformat") else str(lu)
@@ -283,6 +294,12 @@ SOURCE_CONFIGS = {
         "description": "GitLab 仓库文档",
         "default_chunk_tokens": 512,
     },
+    "local": {
+        "kb_name": "ekb_register_html",
+        "source_table": "local_metadata",
+        "description": "本地注册文档 (docx→md)",
+        "default_chunk_tokens": 512,
+    },
 }
 
 # 外部数据源连接信息 — 命令行 / YAML 可覆盖
@@ -395,7 +412,7 @@ def new_uuid():
     return str(uuid.uuid1()).replace("-", "")
 
 
-def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None):
+def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None, task_id=None):
     import psycopg2, psycopg2.extras
     conn = psycopg2.connect(**pg_config)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -405,6 +422,8 @@ def fetch_rows(pg_config, source_table, limit=0, doc_id=0, project_filter=None):
     else:
         query = f"SELECT * FROM {source_table}"
         where = []
+        if task_id:
+            where.append(f"task_id = '{re.sub(r'[^a-zA-Z0-9_-]', '', task_id)}'")
         if project_filter and source_table in ("wiki_metadata", "wangpan_metadata", "git_metadata"):
             if project_filter == "other":
                 where.append("minio_key NOT LIKE '%4.0%' AND minio_key NOT LIKE '%4.5%' AND minio_key NOT LIKE '%5.0%'")
@@ -882,7 +901,8 @@ def import_source(source_key, tenant_id, args):
             kb_name = "ekb_wiki" if source_key == "wiki" else "ekb_pan"
         else:
             ver = args.project.replace("SIP", "")
-            suffix = "wiki" if source_key == "wiki" else ("pan" if source_key == "wangpan" else ("docs" if source_key == "html" else "git"))
+            suffix = {"wiki": "wiki", "wangpan": "pan", "html": "docs",
+                      "git": "git", "local": "register_html"}.get(source_key, source_key)
             kb_name = f"ekb_{ver}_{suffix}"
     if getattr(args, 'dev', False):
         if not kb_name.endswith("_dev"):
@@ -905,7 +925,8 @@ def import_source(source_key, tenant_id, args):
         "dbname": args.pg_db or PG_DEFAULTS["dbname"],
     }
     rows = fetch_rows(pg_config, cfg["source_table"], args.limit, args.doc_id,
-                      project_filter=getattr(args, 'project', None))
+                      project_filter=getattr(args, 'project', None),
+                      task_id=getattr(args, 'task_id', None))
     if not rows and source_key in ("wiki", "wangpan"):
         # Fallback: SIP4.0 → libra, SIP4.5 → libra_h, SIP5.0 → draco
         fb_filters = {"SIP4.0": "libra", "SIP4.5": "libra_h", "SIP5.0": "draco"}
@@ -919,10 +940,9 @@ def import_source(source_key, tenant_id, args):
         print(f"  无数据，跳过\n")
         return kb.id, 0
 
-    # wangpan 源：MinIO 实际路径是 PG 原始 minio_key (4.5/wangpan/...)
-    # local_file_path (wangpan/4.5/...) 前缀顺序不同，在 MinIO 不存在，勿覆盖
+    # wangpan / local 源：MinIO 实际路径是 PG 原始 minio_key
     # file_hash 用 local_md5 做变更检测
-    if source_key == "wangpan":
+    if source_key in ("wangpan", "local"):
         for r in rows:
             if r.get("local_md5"):
                 r["file_hash"] = r["local_md5"]
@@ -1143,11 +1163,13 @@ def main():
                         help="YAML 配置文件路径")
 
     parser.add_argument("--source", default="wiki",
-                        choices=["wiki", "html", "wangpan", "git", "all"],
+                        choices=["wiki", "html", "wangpan", "git", "local", "all"],
                         help="数据源 (默认: wiki)")
     parser.add_argument("--project", default=None,
                         choices=["4.0", "4.5", "5.0"],
                         help="按版本号过滤数据")
+    parser.add_argument("--task-id", default=None,
+                        help="按 task_id 过滤 (local_metadata 源)")
     parser.add_argument("--limit", type=int, default=0,
                         help="每个数据源的导入上限 (0=全部)")
     parser.add_argument("--doc-id", type=int, default=0,
@@ -1243,7 +1265,7 @@ def main():
         return
 
     # ── 确定数据源 ───────────────────────────────────────────────
-    sources = ["wiki", "html", "wangpan", "git"] if args.source == "all" else [args.source]
+    sources = ["wiki", "html", "wangpan", "git", "local"] if args.source == "all" else [args.source]
 
     # ── 逐个导入 ─────────────────────────────────────────────────
     results = {}
