@@ -983,8 +983,8 @@ def import_source(source_key, tenant_id, args):
     pg_project = getattr(args, 'project', None) or "4.5"
     ekb_anomaly_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ekb_anomalies.log")
 
-    # 删除已不存在于外部的文档 (仅在无 limit 全量同步时)
-    if deleted_docs and args.limit == 0:
+    # 删除已不存在于外部的文档 (仅在无 limit 全量同步且非 task_id 过滤时)
+    if deleted_docs and args.limit == 0 and not getattr(args, 'task_id', None):
         print(f"\n  删除 {len(deleted_docs)} 篇...")
         for d in deleted_docs:
             try:
