@@ -34,9 +34,14 @@ from enum import StrEnum
 from common.misc_utils import thread_pool_exec
 from common.token_utils import num_tokens_from_string, total_token_count_from_response
 from rag.llm import FACTORY_DEFAULT_BASE_URL, LITELLM_PROVIDER_PREFIX, SupportedLiteLLMProvider
+from rag.llm.circuit_breaker import llm_circuit_breaker
 from rag.llm.key_utils import _normalize_replicate_key
 from rag.llm.tool_decorator import FunctionToolSession, is_tool
 from rag.nlp import is_chinese, is_english
+
+
+class LLMUnavailableError(Exception):
+    """LLM 调用被熔断器拒绝时的异常(算力不可用, 快速失败而非挂起)。"""
 
 
 class LLMErrorCode(StrEnum):
@@ -640,10 +645,20 @@ class Base(ABC):
             history.insert(0, {"role": "system", "content": system})
         gen_conf = self._clean_conf(gen_conf)
 
+        # 熔断检查: 算力不可用时快速失败, 不再发请求
+        if not llm_circuit_breaker.allow_request():
+            raise LLMUnavailableError(
+                f"LLM circuit breaker open for '{self.model_name}', refusing to send request"
+            )
+
         for attempt in range(self.max_retries + 1):
             try:
-                return await self._async_chat(history, gen_conf, **kwargs)
+                result = await self._async_chat(history, gen_conf, **kwargs)
+                llm_circuit_breaker.record_success()
+                return result
             except Exception as e:
+                # 上报熔断(仅算力侧错误: 超时/连接/服务端)
+                llm_circuit_breaker.record_failure(self._classify_error(e))
                 e = await self._exceptions_async(e, attempt)
                 if e:
                     return e, 0
@@ -1547,6 +1562,12 @@ class LiteLLMBase(ABC):
             request_kwargs=kwargs,
         )
 
+        # 熔断检查: 算力不可用时快速失败
+        if not llm_circuit_breaker.allow_request():
+            raise LLMUnavailableError(
+                f"LLM circuit breaker open for '{self.model_name}', refusing to send request"
+            )
+
         completion_args = self._construct_completion_args(history=hist, stream=False, tools=False, **{**gen_conf, **kwargs})
 
         for attempt in range(self.max_retries + 1):
@@ -1563,8 +1584,10 @@ class LiteLLMBase(ABC):
                 if response.choices[0].finish_reason == "length":
                     ans = self._length_stop(ans)
 
+                llm_circuit_breaker.record_success()
                 return ans, total_token_count_from_response(response)
             except Exception as e:
+                llm_circuit_breaker.record_failure(self._classify_error(e))
                 e = await self._exceptions_async(e, attempt)
                 if e:
                     return e, 0

@@ -26,6 +26,7 @@ import networkx as nx
 from api.db.services.task_service import has_canceled
 from common.token_utils import truncate
 from rag.graphrag.general.graph_prompt import SUMMARIZE_DESCRIPTIONS_PROMPT
+from rag.llm.chat_model import LLMUnavailableError
 from rag.graphrag.utils import (
     GraphChange,
     chat_limiter,
@@ -90,9 +91,13 @@ class Extractor:
                     logging.info(f"Task {task_id} cancelled during entity resolution candidate processing.")
                     raise TaskCanceledException(f"Task {task_id} was cancelled")
             try:
+                # 单次 LLM 调用超时: 默认 120s(原 20 分钟), 可配
+                # GRAPHRAG_LLM_TIMEOUT_SECONDS。算力变慢/不可用时快速失败,
+                # 避免请求长期挂住堆积, 配合熔断器(chat_model.llm_circuit_breaker)止损。
+                llm_timeout_seconds = int(os.environ.get("GRAPHRAG_LLM_TIMEOUT_SECONDS", 120))
                 response = await asyncio.wait_for(
                     self._llm.async_chat(system_msg[0]["content"], hist, conf),
-                    timeout=60 * 20,
+                    timeout=llm_timeout_seconds,
                 )
                 response = self._normalize_response_text(response)
                 response = re.sub(r"^.*</think>", "", response, flags=re.DOTALL)
@@ -102,8 +107,11 @@ class Extractor:
                     await thread_pool_exec(set_llm_cache, self._llm.llm_name, system, response, history, gen_conf)
                 break
             except asyncio.TimeoutError:
-                logging.warning("_async_chat timed out after 20 minutes")
+                logging.warning(f"_async_chat timed out after {llm_timeout_seconds}s")
                 raise  # timeout is not a transient error; do not retry
+            except LLMUnavailableError:
+                # 熔断器打开: 算力整体不可用, 立即失败不重试
+                raise
             except Exception as e:
                 logging.exception(e)
                 if attempt == 2:
