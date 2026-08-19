@@ -640,7 +640,7 @@ def ensure_kb(tenant_id, kb_name, embd_id, chunk_token_num, graphrag_cfg=None, r
 
 def insert_one_document(kb_id, tenant_id, row, chunk_token_num,
                         graphrag_cfg=None, raptor_cfg=None, minio_config=None,
-                        meta=None):
+                        meta=None, write_meta=True):
     from api.db.services.document_service import DocumentService
     from api.db.services.file_service import FileService
     from api.db.services.file2document_service import File2DocumentService
@@ -653,7 +653,8 @@ def insert_one_document(kb_id, tenant_id, row, chunk_token_num,
     title = row.get('title') or minio_key.rsplit('/', 1)[-1]
     file_hash = row.get('file_hash', '')
     suffix = infer_suffix(minio_key)
-    size = get_minio_size(minio_config, bucket, minio_key)
+    # 用 PG local_size 避免每篇一次 MinIO HEAD 网络往返(39259 篇时是主要开销)
+    size = row.get("local_size") or get_minio_size(minio_config, bucket, minio_key)
 
     name = title[:250]
     if suffix and not name.endswith('.' + suffix):
@@ -692,7 +693,8 @@ def insert_one_document(kb_id, tenant_id, row, chunk_token_num,
     })
 
     # 写入文档级元数据 (doc_meta ES 索引)，供检索 enrich 附加到每个 chunk
-    if meta:
+    # write_meta=False 时跳过(39259 篇批量导入提速用，metadata 可后续补写)
+    if write_meta and meta:
         try:
             from api.db.services.doc_metadata_service import DocMetadataService
             DocMetadataService.update_document_metadata(doc_id, meta)
@@ -1043,7 +1045,7 @@ def import_source(source_key, tenant_id, args):
 
             doc_id = insert_one_document(kb.id, tenant_id, row, chunk_tokens,
                                          graphrag_cfg, raptor_cfg, minio_config,
-                                         meta=meta)
+                                         meta=meta, write_meta=not getattr(args, 'no_meta', False))
             doc_ids.append(doc_id)
         except Exception as e:
             print(f"  FAIL: {str(e)[:60]}")
@@ -1203,6 +1205,8 @@ def main():
                         help="启用 RAPTOR 层级摘要")
     parser.add_argument("--no-parse", action="store_true",
                         help="不触发分块+向量化")
+    parser.add_argument("--no-meta", action="store_true",
+                        help="跳过每篇文档级元数据(ES doc_meta)写入，批量导入提速用")
     parser.add_argument("--chunk-tokens", type=int,
                         help="覆盖默认 chunk token 数")
 

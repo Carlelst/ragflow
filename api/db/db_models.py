@@ -268,7 +268,7 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
             try:
                 return super().execute_sql(sql, params, commit)
             except (OperationalError, InterfaceError) as e:
-                error_codes = [2013, 2006]
+                error_codes = [2013, 2006, 1213, 1205]
                 error_messages = ['', 'Lost connection']
                 should_retry = (
                     (hasattr(e, 'args') and e.args and e.args[0] in error_codes) or
@@ -310,7 +310,7 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
             try:
                 return super().begin()
             except (OperationalError, InterfaceError) as e:
-                error_codes = [2013, 2006]
+                error_codes = [2013, 2006, 1213, 1205]
                 error_messages = ['', 'Lost connection']
 
                 should_retry = (
@@ -420,7 +420,7 @@ class RetryingPooledOceanBaseDatabase(PooledMySQLDatabase):
                 # OceanBase/MySQL specific error codes
                 # 2013: Lost connection to MySQL server during query
                 # 2006: MySQL server has gone away
-                error_codes = [2013, 2006]
+                error_codes = [2013, 2006, 1213, 1205]
                 error_messages = ['', 'Lost connection', 'gone away']
 
                 should_retry = (
@@ -461,7 +461,7 @@ class RetryingPooledOceanBaseDatabase(PooledMySQLDatabase):
             try:
                 return super().begin()
             except (OperationalError, InterfaceError) as e:
-                error_codes = [2013, 2006]
+                error_codes = [2013, 2006, 1213, 1205]
                 error_messages = ['', 'Lost connection']
 
                 should_retry = (
